@@ -196,7 +196,10 @@ def convert_to_markdown(messages, title="对话记录"):
     # 如果有长期记忆，附在最后
     if st.session_state.long_term_memory:
         md_lines.append("## 🧠 最终长期记忆 (Summary)")
-        md_lines.append(f"```text\n{st.session_state.long_term_memory}\n```")
+        
+        # === 【修改点】导出时也清洗 ===
+        clean_mem = remove_think_tags(st.session_state.long_term_memory)
+        md_lines.append(f"```text\n{clean_mem}\n```")
         
     return "\n".join(md_lines)
 
@@ -218,6 +221,17 @@ def get_client(api_key, base_url):
     if not api_key: api_key = "EMPTY" 
     http_client = httpx.Client(trust_env=False)
     return OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+
+
+def remove_think_tags(text):
+    """
+    清洗工具：移除文本中的 <think> 标签及其内容
+    """
+    if not text: return ""
+    # === 【修正】正则改为匹配 <think> 标签 ===
+    pattern = r"<think>.*?</think>"
+    cleaned_text = re.sub(pattern, "", text, flags=re.DOTALL | re.IGNORECASE)
+    return cleaned_text.strip()
 
 def parse_response(text):
     if not text: return None, ""
@@ -547,8 +561,20 @@ def step_logic():
                 # 调用模型 (传入空列表，因为内容都在 Prompt 里了)
                 raw_summary = generate_reply(conf_mod, [], is_moderator=True, override_system=summary_prompt)
                 
-                # 检查摘要是否为空
-                if not raw_summary or not raw_summary.strip():
+                # === 【修正】直接复用或者修正正则 ===
+                def clean_thought_content(text):
+                    if not text: return ""
+                    # 修正正则为 <think>
+                    pattern = r"<think>.*?</think>"
+                    cleaned = re.sub(pattern, "", text, flags=re.DOTALL | re.IGNORECASE)
+                    return cleaned.strip()
+
+                # 获取纯净的摘要正文
+                final_summary = clean_thought_content(raw_summary)
+                # ========================================
+                
+                # 检查摘要是否为空 (检查清洗后的)
+                if not final_summary:
                     print(f"\n{"="*50}")
                     print("⚠️ [系统警告] 摘要为空，停止提炼。")
                     print(f"{"="*50}\n")
@@ -560,24 +586,27 @@ def step_logic():
                 # 检查内容收敛（相似度检测）
                 # 注意：增量更新时，相似度可能会比较低（因为加了新东西），
                 # 但如果剧情没推进，相似度会高，所以保留这个检查是合理的。
-                similarity = difflib.SequenceMatcher(None, refiner['last_summary'], raw_summary).ratio()
+                # 相似度检查 (使用清洗后的对比)
+                similarity = difflib.SequenceMatcher(None, refiner['last_summary'], final_summary).ratio()
                 if similarity > 0.95:
                     print(f"\n{"="*50}")
                     print(f"✅ [系统] 内容已收敛 (相似度 {similarity:.2%})，停止无意义的重复生成。")
                     print(f"{"="*50}\n")
                     st.toast(f"内容已收敛，停止提炼。", icon="✅")
-                    refiner['last_summary'] = raw_summary  # 更新最后状态
+                    refiner['last_summary'] = final_summary  # 更新最后状态
                     refiner['refine_turn'] = 0  # 重置计数器
                     # 更新 Session State 中的长期记忆
-                    st.session_state.long_term_memory = raw_summary
+                    st.session_state.long_term_memory = final_summary
                     # 插入系统日志消息以改变last_role，防止死循环
                     st.session_state.messages.append({"role": "System_Log", "content": "Memory Converged", "hidden": True})
                     return True
                 
                 # === 成功提炼后的状态更新 ===
-                refiner['last_summary'] = raw_summary
+                refiner['last_summary'] = final_summary  # 存入纯净版
                 refiner['refine_turn'] += 1
-                st.session_state.long_term_memory = raw_summary
+                
+                # 【关键】存入长期记忆的必须是纯净版
+                st.session_state.long_term_memory = final_summary
                 
                 # 【关键】更新游标：下次提炼从这里开始
                 st.session_state.last_sum_idx = len(st.session_state.messages)
@@ -586,7 +615,7 @@ def step_logic():
                 print("\n" + "="*50)
                 print(f"🕵️ [提炼员] 增量更新成功 (处理了 {len(new_msgs)} 条新消息):")
                 # 使用黄色高亮 (ANSI Escape Code)
-                print(f"\033[93m{raw_summary}\033[0m")
+                print(f"\033[93m{final_summary}\033[0m")
                 print("="*50 + "\n")
                 
                 # UI 反馈 (仅 Toast)
@@ -663,7 +692,10 @@ def step_logic():
 # 显示长期记忆监视器 (可选，方便调试，也可以注释掉)
 if st.session_state.long_term_memory:
     with st.expander("🧠 当前长期记忆 (Long-term Memory Status)", expanded=False):
-        st.info(st.session_state.long_term_memory)
+        # === 【修改点】在这里调用清洗函数 ===
+        # 即使后台变量里混入了思考过程，展示给用户时也会被过滤掉
+        clean_memory_display = remove_think_tags(st.session_state.long_term_memory)
+        st.info(clean_memory_display)
 
 for msg in st.session_state.messages:
     # 不渲染隐藏消息
