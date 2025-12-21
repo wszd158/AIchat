@@ -1,0 +1,11 @@
+# Python编译生成的缓存文件夹
+__pycache__/
+
+# 配置文件目录（包含敏感信息）
+configs/
+
+# 照片资源目录
+photos/
+
+# 对话历史记录目录
+history/
