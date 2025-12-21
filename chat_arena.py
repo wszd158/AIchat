@@ -210,6 +210,9 @@ if "long_term_memory" not in st.session_state: st.session_state.long_term_memory
 # 新增：提炼员状态跟踪变量
 if "refiner_state" not in st.session_state: st.session_state.refiner_state = {'last_summary': "", 'refine_turn': 0, 'MAX_REFINE_TURNS': 3}
 
+# === 【新增】初始化提炼游标 ===
+if "last_sum_idx" not in st.session_state: st.session_state.last_sum_idx = 0
+
 # --- LLM 逻辑 ---
 def get_client(api_key, base_url):
     if not api_key: api_key = "EMPTY" 
@@ -298,7 +301,37 @@ def generate_reply(agent_config, global_messages, is_moderator=False, override_s
             messages=final_payload,
             temperature=agent_config['temp']
         )
-        return response.choices[0].message.content
+        
+        # === 【核心修改开始】 ===
+        message = response.choices[0].message
+        content = message.content
+        
+        # 1. 尝试获取 DeepSeek 官方/兼容 API 的原生思考字段
+        # 不同的 API 库可能存在 message.reasoning_content 属性，或者在 extra_fields 里
+        reasoning = getattr(message, 'reasoning_content', None)
+        
+        # 2. 如果标准属性里没有，尝试从 model_extra (Pydantic models) 或 dict 中找
+        if not reasoning:
+            # 某些库版本把额外字段藏在 dict 里
+            try:
+                # 针对不同的 openai 库版本进行防御性编程
+                if hasattr(message, 'model_dump'):
+                    msg_dict = message.model_dump()
+                elif hasattr(message, 'to_dict'):
+                    msg_dict = message.to_dict()
+                else:
+                    msg_dict = message.__dict__
+                
+                reasoning = msg_dict.get('reasoning_content')
+            except:
+                pass
+
+        # 3. 如果抓到了原生思考内容，手动把它拼回去！
+        # 这样你的 parse_response 函数（依赖于 <think> 标签）才能正常工作
+        if reasoning:
+            content = f"<think>{reasoning}</think>\n{content}"
+
+        return content
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -334,6 +367,11 @@ with st.sidebar:
             st.session_state.auto_playing = False
             # 重置提炼员状态
             st.session_state.refiner_state = {'last_summary': "", 'refine_turn': 0, 'MAX_REFINE_TURNS': 3}
+            
+            # === 【新增】重置游标 ===
+            st.session_state.last_sum_idx = 0
+            # =======================
+            
             st.rerun()
             
         save_name = st.text_input("历史文件名", value=f"历史对话_{datetime.now().strftime('%m%d_%H%M')}")
@@ -460,33 +498,53 @@ def step_logic():
         history_content = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.messages[-20:]])
         
         if mode == "summarizer":
-            # === 幕后提炼模式 ===
-            # 获取提炼员状态
+            # === 幕后提炼模式 (增量更新版) ===
             refiner = st.session_state.refiner_state
             
-            # 检查是否达到最大提炼轮数
+            # 1. 获取增量对话 (只获取上次提炼后新产生的对话)
+            start_idx = st.session_state.last_sum_idx
+            new_msgs = st.session_state.messages[start_idx:]
+            
+            # 如果没有新消息 (防止重复提炼)
+            if not new_msgs:
+                st.session_state.refiner_state['refine_turn'] = 0
+                st.session_state.messages.append({"role": "System_Log", "content": "No new messages to refine", "hidden": True})
+                return True
+
+            # 转换新消息为文本
+            new_history_text = "\n".join([f"[{m['role']}]: {m['content']}" for m in new_msgs if not m.get("hidden")])
+            
+            # 获取当前的旧记忆
+            current_memory = st.session_state.long_term_memory if st.session_state.long_term_memory else "（暂无初期记忆）"
+
+            # 检查最大轮数限制
             if refiner['refine_turn'] >= refiner['MAX_REFINE_TURNS']:
                 print(f"\n{"="*50}")
                 print("⚠️ [系统警告] 达到最大提炼轮数限制，停止提炼。")
                 print(f"{"="*50}\n")
                 st.toast("达到最大提炼轮数限制，停止提炼。", icon="🛑")
-                refiner['refine_turn'] = 0  # 重置计数器
-                # 插入系统日志消息以改变last_role，防止死循环
-                st.session_state.messages.append({"role": "System_Log", "content": "Memory Updated", "hidden": True})
+                refiner['refine_turn'] = 0
+                st.session_state.messages.append({"role": "System_Log", "content": "Refine Limit Hit", "hidden": True})
                 return True
             
-            with st.spinner("🕵️ 提炼员正在后台整理记忆..."):
-                # 构造专门的提炼 Prompt
+            with st.spinner("🕵️ 提炼员正在执行【增量记忆更新】..."):
+                # === 构造增量更新 Prompt ===
                 summary_prompt = (
-                    f"{conf_mod['system']}\n\n"
-                    "请阅读以下对话记录，并生成一段简练的【前情提要】(Long-term Memory)。"
-                    "重点包含：双方达成的共识、关键冲突点、以及当前待解决的问题。"
-                    "输出不要超过 300 字。不要包含客套话，直接输出摘要内容。\n\n"
-                    f"【对话记录】:\n{history_content}"
+                    f"【系统指令】\n{conf_mod['system']}\n\n"
+                    "【当前任务】\n"
+                    "请基于【现有长期记忆】和【新增对话剧情】，合并生成一份更新后的长期记忆。\n"
+                    "你的目标是维护一份连贯的剧情大纲，不要遗漏之前的关键设定，同时加入最新的进展。\n\n"
+                    "⚠️ 严格约束：\n"
+                    "1. 严禁生成对话、剧本或括号内的动作描写。\n"
+                    "2. 必须以客观的第三人称叙述（如：'角色A做了什么...'）。\n"
+                    "3. 篇幅控制在 300-500 字以内，剔除无关的寒暄。\n\n"
+                    f"📜 【现有长期记忆】:\n{current_memory}\n\n"
+                    f"➕ 【新增对话剧情】:\n{new_history_text}\n\n"
+                    "【最终输出】\n"
+                    "请直接输出更新后的完整长期记忆摘要："
                 )
                 
-                # 调用模型 (复用 generate_reply 但覆盖 system 和 history)
-                # 这里我们 trick 一下，直接把 prompt 当作 system 发送，history 留空
+                # 调用模型 (传入空列表，因为内容都在 Prompt 里了)
                 raw_summary = generate_reply(conf_mod, [], is_moderator=True, override_system=summary_prompt)
                 
                 # 检查摘要是否为空
@@ -496,11 +554,12 @@ def step_logic():
                     print(f"{"="*50}\n")
                     st.toast("摘要为空，停止提炼。", icon="⚠️")
                     refiner['refine_turn'] = 0  # 重置计数器
-                    # 插入系统日志消息以改变last_role，防止死循环
-                    st.session_state.messages.append({"role": "System_Log", "content": "Memory Updated", "hidden": True})
+                    st.session_state.messages.append({"role": "System_Log", "content": "Empty Summary", "hidden": True})
                     return True
-                
+
                 # 检查内容收敛（相似度检测）
+                # 注意：增量更新时，相似度可能会比较低（因为加了新东西），
+                # 但如果剧情没推进，相似度会高，所以保留这个检查是合理的。
                 similarity = difflib.SequenceMatcher(None, refiner['last_summary'], raw_summary).ratio()
                 if similarity > 0.95:
                     print(f"\n{"="*50}")
@@ -512,27 +571,28 @@ def step_logic():
                     # 更新 Session State 中的长期记忆
                     st.session_state.long_term_memory = raw_summary
                     # 插入系统日志消息以改变last_role，防止死循环
-                    st.session_state.messages.append({"role": "System_Log", "content": "Memory Updated", "hidden": True})
+                    st.session_state.messages.append({"role": "System_Log", "content": "Memory Converged", "hidden": True})
                     return True
                 
-                # 更新提炼状态
+                # === 成功提炼后的状态更新 ===
                 refiner['last_summary'] = raw_summary
                 refiner['refine_turn'] += 1
-                
-                # 更新 Session State 中的长期记忆
                 st.session_state.long_term_memory = raw_summary
                 
-                # --- 核心：打印到终端 (Terminal) ---
+                # 【关键】更新游标：下次提炼从这里开始
+                st.session_state.last_sum_idx = len(st.session_state.messages)
+                
+                # 打印日志
                 print("\n" + "="*50)
-                print(f"🕵️ [提炼员日志] 第 {current_turns} 轮摘要生成 (第{refiner['refine_turn']}次提炼):")
+                print(f"🕵️ [提炼员] 增量更新成功 (处理了 {len(new_msgs)} 条新消息):")
                 # 使用黄色高亮 (ANSI Escape Code)
                 print(f"\033[93m{raw_summary}\033[0m")
                 print("="*50 + "\n")
                 
                 # UI 反馈 (仅 Toast)
-                st.toast(f"记忆已提炼 (查看终端日志)", icon="🧠")
+                st.toast(f"记忆已更新 (处理了 {len(new_msgs)} 条新消息)", icon="🧠")
                 
-                # 插入系统日志消息以改变last_role，防止死循环
+                # 插入 Log 切换回合
                 st.session_state.messages.append({"role": "System_Log", "content": "Memory Updated", "hidden": True})
                 
                 return True
@@ -559,10 +619,18 @@ def step_logic():
 
     with st.chat_message(next_agent["name"], avatar=avatar):
         with st.spinner(f"{next_agent['name']} 正在思考..."):
-            # 不再需要构建本地历史，generate_reply 函数会自己处理
+            # === 【核心修改：实施短期记忆切片】 ===
+            # 1. 获取配置中的限制数
+            limit = cfg["global"]["context_limit"]
             
-            # 这里调用 generate_reply 时，会自动注入 st.session_state.long_term_memory
-            raw_resp = generate_reply(next_agent, st.session_state.messages)
+            # 2. 对历史消息进行切片 (只取最近的 N 条)
+            # 注意：如果历史总数小于 limit，Python 的切片会自动处理，不会报错
+            short_term_history = st.session_state.messages[-limit:]
+            
+            # 3. 把切片后的短历史传给 LLM
+            # 注意：generate_reply 内部会自动把 System (含长期记忆) 拼在最前面
+            raw_resp = generate_reply(next_agent, short_term_history)
+            # ==================================
             
             thought = None
             reply = raw_resp
